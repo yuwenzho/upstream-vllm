@@ -268,7 +268,9 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             else 0
         )
         self.gqa_interleaved_layout = gqa_interleaved_layout
-        self._forward_method = self.forward_cuda
+        self._forward_method = (
+            self.forward_xpu if current_platform.is_xpu() else self.forward_cuda
+        )
 
         # QKV
         self.conv_dim = self.key_dim * 2 + self.value_dim
@@ -566,6 +568,57 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             b,
             a,
             core_attn_out,
+            self.prefix,
+        )
+
+        # ============================================================
+        # Part 3: Output Projection
+        # ============================================================
+        z_shape_og = z.shape
+        # Reshape input data into 2D tensor
+        core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
+        z = z.reshape(-1, z.shape[-1])
+        core_attn_out = self.norm(core_attn_out, z)
+        core_attn_out = core_attn_out.reshape(z_shape_og)
+        core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
+        output[:num_tokens], _ = self.out_proj(core_attn_out)
+
+    def forward_xpu(
+        self,
+        hidden_states: torch.Tensor,
+        output: torch.Tensor,
+    ):
+        """
+        Forward pass with three parts:
+        1. Input projection
+        2. Core attention (custom op)
+        3. Output projection
+        """
+        num_tokens = hidden_states.size(0)
+
+        assert not hasattr(self, "in_proj_qkv"), "lora isn't supported on XPU."
+
+        # ============================================================
+        # Part 1: Input Projection
+        # ============================================================
+        projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
+        projected_states_ba, _ = self.in_proj_ba(hidden_states)
+
+        # ============================================================
+        # Part 2: Core Attention
+        # ============================================================
+        core_attn_out = torch.zeros(
+            (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        z = torch.empty_like(core_attn_out)
+
+        torch.ops.vllm.gdn_attention_core_xpu(
+            core_attn_out,
+            z,
+            projected_states_qkvz,
+            projected_states_ba,
             self.prefix,
         )
 
@@ -978,79 +1031,6 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         )
         return
 
-    def _forward_core_xpu(
-        self,
-        mixed_qkv: torch.Tensor,
-        b: torch.Tensor,
-        a: torch.Tensor,
-        core_attn_out: torch.Tensor,
-    ):
-        """XPU core attention using the fused SYCL GDN kernel.
-
-        The SYCL kernel currently expects unsplit tensors, so we cat
-        ``mixed_qkv``/``b``/``a`` back into the original layout, this
-        reverses the split done in ``forward_cuda`` Part 1.
-        """
-        forward_context = get_forward_context()
-        attn_metadata: AttentionMetadata = forward_context.attn_metadata
-
-        if attn_metadata is None:
-            return
-
-        assert isinstance(attn_metadata, dict)
-        attn_metadata = attn_metadata[self.prefix]
-
-        # TODO: xpu does not support speculative decoding yet
-        assert attn_metadata.spec_sequence_masks is None
-
-        # Reconstruct projected_states_qkvz = [mixed_qkv | z_placeholder].
-        z_size = self.head_v_dim * (self.num_v_heads // self.tp_size)
-        z_placeholder = torch.empty(
-            mixed_qkv.shape[0],
-            z_size,
-            dtype=mixed_qkv.dtype,
-            device=mixed_qkv.device,
-        )
-        projected_states_qkvz = torch.cat(
-            [mixed_qkv, z_placeholder],
-            dim=-1,
-        )
-        projected_states_ba = torch.cat([b, a], dim=-1)
-
-        z_out = torch.empty_like(core_attn_out)
-
-        conv_weights = self.conv1d.weight.view(
-            self.conv1d.weight.size(0),
-            self.conv1d.weight.size(2),
-        )
-
-        num_actual_tokens = attn_metadata.num_actual_tokens
-        torch.ops._xpu_C.gdn_attention(
-            core_attn_out,
-            z_out,
-            projected_states_qkvz,
-            projected_states_ba,
-            self.num_k_heads,
-            self.num_v_heads,
-            self.head_k_dim,
-            self.head_v_dim,
-            conv_state=self.kv_cache[0],
-            ssm_state=self.kv_cache[1],
-            conv_weights=conv_weights,
-            conv_bias=self.conv1d.bias,
-            activation=self.activation,
-            A_log=self.A_log,
-            dt_bias=self.dt_bias,
-            num_prefills=attn_metadata.num_prefills,
-            num_decodes=attn_metadata.num_decodes,
-            has_initial_state=attn_metadata.has_initial_state,
-            non_spec_query_start_loc=attn_metadata.non_spec_query_start_loc,
-            non_spec_state_indices_tensor=attn_metadata.non_spec_state_indices_tensor,
-            num_actual_tokens=num_actual_tokens,
-            tp_size=self.tp_size,
-            reorder_input=not self.gqa_interleaved_layout,
-        )
-
 
 def gdn_attention_core(
     mixed_qkv: torch.Tensor,
@@ -1066,20 +1046,12 @@ def gdn_attention_core(
     """
     forward_context: ForwardContext = get_forward_context()
     self = forward_context.no_compile_layers[layer_name]
-    if current_platform.is_xpu():
-        self._forward_core_xpu(
-            mixed_qkv=mixed_qkv,
-            b=b,
-            a=a,
-            core_attn_out=core_attn_out,
-        )
-    else:
-        self._forward_core(
-            mixed_qkv=mixed_qkv,
-            b=b,
-            a=a,
-            core_attn_out=core_attn_out,
-        )
+    self._forward_core(
+        mixed_qkv=mixed_qkv,
+        b=b,
+        a=a,
+        core_attn_out=core_attn_out,
+    )
 
 
 def gdn_attention_core_fake(
