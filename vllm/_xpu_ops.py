@@ -9,7 +9,6 @@ from vllm_xpu_kernels.flash_attn_interface import flash_attn_varlen_func
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
-from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
 logger = init_logger(__name__)
 
@@ -85,6 +84,7 @@ def _gdn_attention_core_xpu_impl(
 ) -> None:
     """Custom op wrapping the XPU SYCL GDN kernel for torch.compile."""
     from vllm.forward_context import get_forward_context
+    from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
     forward_context = get_forward_context()
     self = forward_context.no_compile_layers[layer_name]
