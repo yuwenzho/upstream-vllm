@@ -105,17 +105,17 @@ def _gdn_attention_core_xpu_impl(
 
     forward_context = get_forward_context()
     self = forward_context.no_compile_layers[layer_name]
-    attn_metadata = forward_context.attn_metadata
+    attn_metadata_raw = forward_context.attn_metadata
 
-    if attn_metadata is None:
+    if attn_metadata_raw is None:
         return
 
-    assert isinstance(attn_metadata, dict)
-    attn_metadata = attn_metadata[self.prefix]
+    assert isinstance(attn_metadata_raw, dict)
+    attn_metadata = attn_metadata_raw[self.prefix]
     assert isinstance(attn_metadata, GDNAttentionMetadata)
 
     # TODO: xpu does not support speculative decoding yet
-    assert attn_metadata.spec_sequence_masks is None
+    assert attn_metadata.spec_sequence_masks is None # type: ignore[attr-defined]
 
     conv_weights = self.conv1d.weight.view(
         self.conv1d.weight.size(0), self.conv1d.weight.size(2)
@@ -137,12 +137,12 @@ def _gdn_attention_core_xpu_impl(
         activation=self.activation,
         A_log=self.A_log,
         dt_bias=self.dt_bias,
-        num_prefills=attn_metadata.num_prefills,
-        num_decodes=attn_metadata.num_decodes,
-        has_initial_state=attn_metadata.has_initial_state,
-        non_spec_query_start_loc=attn_metadata.non_spec_query_start_loc,
-        non_spec_state_indices_tensor=attn_metadata.non_spec_state_indices_tensor,
-        num_actual_tokens=attn_metadata.num_actual_tokens,
+        num_prefills=attn_metadata.num_prefills, # type: ignore[attr-defined]
+        num_decodes=attn_metadata.num_decodes, # type: ignore[attr-defined]
+        has_initial_state=attn_metadata.has_initial_state, # type: ignore[attr-defined]
+        non_spec_query_start_loc=attn_metadata.non_spec_query_start_loc, # type: ignore[attr-defined]
+        non_spec_state_indices_tensor=attn_metadata.non_spec_state_indices_tensor, # type: ignore[attr-defined]
+        num_actual_tokens=attn_metadata.num_actual_tokens, # type: ignore[attr-defined]
         tp_size=self.tp_size,
         reorder_input=not self.gqa_interleaved_layout,
     )
