@@ -115,7 +115,7 @@ def _gdn_attention_core_xpu_impl(
     assert isinstance(attn_metadata, GDNAttentionMetadata)
 
     # TODO: xpu does not support speculative decoding yet
-    assert attn_metadata.spec_sequence_masks is None # type: ignore[attr-defined]
+    assert attn_metadata.spec_sequence_masks is None  # type: ignore[attr-defined]
 
     conv_weights = self.conv1d.weight.view(
         self.conv1d.weight.size(0), self.conv1d.weight.size(2)
@@ -137,12 +137,12 @@ def _gdn_attention_core_xpu_impl(
         activation=self.activation,
         A_log=self.A_log,
         dt_bias=self.dt_bias,
-        num_prefills=attn_metadata.num_prefills, # type: ignore[attr-defined]
-        num_decodes=attn_metadata.num_decodes, # type: ignore[attr-defined]
-        has_initial_state=attn_metadata.has_initial_state, # type: ignore[attr-defined]
-        non_spec_query_start_loc=attn_metadata.non_spec_query_start_loc, # type: ignore[attr-defined]
-        non_spec_state_indices_tensor=attn_metadata.non_spec_state_indices_tensor, # type: ignore[attr-defined]
-        num_actual_tokens=attn_metadata.num_actual_tokens, # type: ignore[attr-defined]
+        num_prefills=attn_metadata.num_prefills,  # type: ignore[attr-defined]
+        num_decodes=attn_metadata.num_decodes,  # type: ignore[attr-defined]
+        has_initial_state=attn_metadata.has_initial_state,  # type: ignore[attr-defined]
+        non_spec_query_start_loc=attn_metadata.non_spec_query_start_loc,  # type: ignore[attr-defined]
+        non_spec_state_indices_tensor=attn_metadata.non_spec_state_indices_tensor,  # type: ignore[attr-defined]
+        num_actual_tokens=attn_metadata.num_actual_tokens,  # type: ignore[attr-defined]
         tp_size=self.tp_size,
         reorder_input=not self.gqa_interleaved_layout,
     )
