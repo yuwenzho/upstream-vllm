@@ -272,6 +272,7 @@ class CPUFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
             if params.weight_scale_inv is not None
             else params.weight_scale
         )
+        assert weight_scale is not None
         replace_parameter(
             layer,
             scale_attr,
