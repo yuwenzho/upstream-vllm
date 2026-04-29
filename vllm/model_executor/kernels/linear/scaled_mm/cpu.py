@@ -11,7 +11,6 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     convert_to_channelwise,
 )
 from vllm.model_executor.layers.utils import check_cpu_sgl_kernel
-from vllm.model_executor.utils import replace_parameter as model_replace_parameter
 from vllm.platforms import current_platform
 from vllm.platforms.interface import CpuArchEnum
 
@@ -255,7 +254,11 @@ class CPUFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         # which is GPU-oriented.  Instead, VNNI-prepack weights for AMX.
         params = self._get_layer_params(layer)
         packed_weight = torch.ops._C.convert_weight_packed(params.weight)
-        model_replace_parameter(layer, params.WEIGHT, packed_weight)
+        replace_parameter(
+            layer,
+            params.WEIGHT,
+            torch.nn.Parameter(packed_weight, requires_grad=False),
+        )
 
         # Re-wrap scale as a plain Parameter so the kernel can read it
         # without weight-loader metadata interfering.
@@ -269,7 +272,11 @@ class CPUFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
             if params.weight_scale_inv is not None
             else params.weight_scale
         )
-        model_replace_parameter(layer, scale_attr, weight_scale.data)
+        replace_parameter(
+            layer,
+            scale_attr,
+            torch.nn.Parameter(weight_scale.data, requires_grad=False),
+        )
 
     def apply_weights(
         self,
