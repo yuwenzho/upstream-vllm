@@ -3206,6 +3206,27 @@ def fused_experts_cpu(
     )
 
 
+if hasattr(torch.ops._C, "fused_experts_mxfp4_cpu"):
+
+    @register_fake("_C::fused_experts_mxfp4_cpu")
+    def fused_experts_mxfp4_cpu_fake(
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        inplace: bool,
+        w1_scale: torch.Tensor,
+        w2_scale: torch.Tensor,
+        w1_bias: torch.Tensor | None,
+        w2_bias: torch.Tensor | None,
+        alpha: float | None,
+        limit: float | None,
+        is_vnni: bool,
+    ) -> torch.Tensor:
+        return torch.empty_like(hidden_states)
+
+
 if hasattr(torch.ops._C, "int8_scaled_mm_with_quant"):
 
     @register_fake("_C::int8_scaled_mm_with_quant")
@@ -3540,6 +3561,38 @@ def cpu_activation_lut_bf16(input: torch.Tensor, activation: str) -> torch.Tenso
     out = torch.empty_like(input)
     torch.ops._C.activation_lut_bf16(out, input, activation)
     return out
+
+
+def cpu_fused_experts_mxfp4(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    inplace: bool,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    w1_bias: torch.Tensor | None = None,
+    w2_bias: torch.Tensor | None = None,
+    alpha: float | None = None,
+    limit: float | None = None,
+    is_vnni: bool = True,
+) -> torch.Tensor:
+    return torch.ops._C.fused_experts_mxfp4_cpu(
+        hidden_states,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        inplace,
+        w1_scale,
+        w2_scale,
+        w1_bias,
+        w2_bias,
+        alpha,
+        limit,
+        is_vnni,
+    )
 
 
 def cpu_prepack_moe_weight(

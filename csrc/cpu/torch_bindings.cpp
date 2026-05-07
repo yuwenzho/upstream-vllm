@@ -62,6 +62,8 @@ at::Tensor weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2,
 
 at::Tensor convert_weight_packed(at::Tensor& weight);
 
+at::Tensor convert_scale_packed(at::Tensor& scale);
+
 at::Tensor fused_experts_cpu(
     at::Tensor& hidden_states, at::Tensor& w1, at::Tensor& w2,
     at::Tensor& topk_weights, at::Tensor& topk_ids, bool inplace,
@@ -71,6 +73,16 @@ at::Tensor fused_experts_cpu(
     const std::optional<std::vector<int64_t>> block_size,
     const std::optional<at::Tensor>& a1_scale,
     const std::optional<at::Tensor>& a2_scale, bool is_vnni);
+
+at::Tensor fused_experts_mxfp4_cpu(at::Tensor& hidden_states, at::Tensor& w1,
+                                   at::Tensor& w2, at::Tensor& topk_weights,
+                                   at::Tensor& topk_ids, bool inplace,
+                                   at::Tensor& w1_scale, at::Tensor& w2_scale,
+                                   const std::optional<at::Tensor>& w1_bias,
+                                   const std::optional<at::Tensor>& w2_bias,
+                                   const std::optional<double>& alpha,
+                                   const std::optional<double>& limit,
+                                   bool is_vnni);
 
 at::Tensor int8_scaled_mm_with_quant(at::Tensor& mat1, at::Tensor& mat2,
                                      at::Tensor& scales2,
@@ -359,6 +371,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("weight_packed_linear", torch::kCPU, &weight_packed_linear);
   ops.def("convert_weight_packed(Tensor! weight) -> Tensor");
   ops.impl("convert_weight_packed", torch::kCPU, &convert_weight_packed);
+  ops.def("convert_scale_packed(Tensor! scale) -> Tensor");
+  ops.impl("convert_scale_packed", torch::kCPU, &convert_scale_packed);
   ops.def(
       "fused_experts_cpu(Tensor! hidden_states, Tensor w1, Tensor w2, Tensor "
       "topk_weights, Tensor topk_ids, bool inplace, bool use_int8_w8a8, bool "
@@ -366,6 +380,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "block_size, Tensor? a1_scale, Tensor? a2_scale, bool is_vnni) -> "
       "Tensor");
   ops.impl("fused_experts_cpu", torch::kCPU, &fused_experts_cpu);
+  ops.def(
+      "fused_experts_mxfp4_cpu(Tensor! hidden_states, Tensor! w1, Tensor! w2, "
+      "Tensor topk_weights, Tensor topk_ids, bool inplace, "
+      "Tensor! w1_scale, Tensor! w2_scale, "
+      "Tensor? w1_bias, Tensor? w2_bias, "
+      "float? alpha, float? limit, bool is_vnni) -> Tensor");
+  ops.impl("fused_experts_mxfp4_cpu", torch::kCPU, &fused_experts_mxfp4_cpu);
   ops.def(
       "int8_scaled_mm_with_quant(Tensor mat1, Tensor mat2, Tensor scales2, "
       "Tensor? bias, ScalarType out_dtype, bool is_vnni) -> Tensor");

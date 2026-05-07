@@ -1125,7 +1125,7 @@ at::Tensor fused_experts_cpu(
       scalar_t* __restrict__ B_tmp = (scalar_t*)((void*)(intermediate_cache0 + M * topk * 2 * N));
 
       CHECK_MOE_SCALES_FP8(1, 2);
-      fused_experts_fp8_kernel_impl(
+      fused_experts_fp_kernel_impl<scalar_t, at::Float8_e4m3fn, float, false>(
           out_hidden_states.data_ptr<scalar_t>(),
           intermediate_cache0,
           intermediate_cache1,
@@ -1136,6 +1136,8 @@ at::Tensor fused_experts_cpu(
           hidden_states.data_ptr<scalar_t>(),
           packed_w1.data_ptr<at::Float8_e4m3fn>(),
           packed_w2.data_ptr<at::Float8_e4m3fn>(),
+          nullptr,  // w1_bias
+          nullptr,  // w2_bias
           w1s.data_ptr<float>(),
           w2s.data_ptr<float>(),
           block_size_N,
@@ -1149,7 +1151,11 @@ at::Tensor fused_experts_cpu(
           K,
           E,
           topk,
-          num_tokens_post_pad);
+          num_tokens_post_pad,
+          0,  // alpha
+          0,  // limit
+          CPUAcTMethod::silu_and_mul,
+          false);  // with_bias
     } else {
       scalar_t* __restrict__ A_tmp = intermediate_cache2 + M * topk * K;
       float* __restrict__ C_tmp = (float*)((void*)(A_tmp + num_threads * BLOCK_M * K));
@@ -1325,6 +1331,154 @@ at::Tensor shared_expert_cpu(
           N,
           K);
     }
+  });
+  return out_hidden_states;
+}
+
+// MXFP4 W4A16 fused experts kernel
+// hidden_states: [M, K]
+// w1: [E, 2N, K/2] (uint8, packed MXFP4)
+// w2: [E, K, N/2] (uint8, packed MXFP4)
+// w1_scale: [E, 2N, K/32] (uint8, e8m0 scales)
+// w2_scale: [E, K, N/32] (uint8, e8m0 scales)
+// topk_weights: [M, topk]
+// topk_ids: [M, topk] (int32_t)
+at::Tensor fused_experts_mxfp4_cpu(
+    at::Tensor& hidden_states,
+    at::Tensor& w1,
+    at::Tensor& w2,
+    at::Tensor& topk_weights,
+    at::Tensor& topk_ids,
+    bool inplace,
+    at::Tensor& w1_scale,
+    at::Tensor& w2_scale,
+    const std::optional<at::Tensor>& w1_bias,
+    const std::optional<at::Tensor>& w2_bias,
+    const std::optional<double>& alpha,
+    const std::optional<double>& limit,
+    bool is_vnni) {
+  RECORD_FUNCTION("sgl-kernel::fused_experts_mxfp4_cpu", std::vector<c10::IValue>({hidden_states, w1, w2, topk_weights, topk_ids}));
+
+  auto packed_w1 = is_vnni ? w1 : convert_weight_packed(w1);
+  auto packed_w2 = is_vnni ? w2 : convert_weight_packed(w2);
+
+  constexpr int64_t BLOCK_M = block_size_m();
+  constexpr int64_t BLOCK_N = block_size_n();
+
+  const auto st = hidden_states.scalar_type();
+  CHECK_INPUT(hidden_states);
+  CHECK_INPUT(w1);
+  CHECK_INPUT(w2);
+  CHECK_EQ(topk_weights.sizes(), topk_ids.sizes());
+  CHECK_DIM(2, hidden_states);
+  CHECK_DIM(3, w1);
+  CHECK_DIM(3, w2);
+  CHECK_DIM(2, topk_weights);
+  CHECK_DIM(2, topk_ids);
+
+  CHECK_EQ(topk_ids.scalar_type(), at::kInt);
+  CHECK_EQ(topk_weights.scalar_type(), at::kFloat);
+
+  int64_t M = hidden_states.size(0);
+  int64_t K = hidden_states.size(1);
+  int64_t N = w1.size(1) / 2;
+  int64_t E = w1.size(0);
+  int64_t topk = topk_weights.size(1);
+
+  // mxfp4: packed_K = K/2, packed_N = N/2
+  int64_t packed_K = get_row_size<uint8_t>(K);
+  int64_t packed_N = get_row_size<uint8_t>(N);
+
+  // check weight shapes
+  CHECK_EQ(w2.size(0), E);
+  CHECK_EQ(w2.size(1), K);
+  CHECK_EQ(packed_w1.size(2), packed_K);
+  CHECK_EQ(packed_w2.size(2), packed_N);
+
+  // check scales
+  TORCH_CHECK(w1_scale.numel() == E * 2 * N * K / 32, "w1_scale size mismatch");
+  TORCH_CHECK(w2_scale.numel() == E * K * N / 32, "w2_scale size mismatch");
+
+  at::Tensor out_hidden_states = inplace ? hidden_states : at::empty_like(hidden_states);
+
+  int num_threads = at::get_num_threads();
+  int64_t max_num_tokens_padded = M * topk + E * (BLOCK_M - 1);
+  int64_t max_num_blocks = div_up(max_num_tokens_padded, BLOCK_M);
+  auto buffer = at::empty(
+      {max_num_tokens_padded + max_num_blocks + (num_threads + 1) * E + (E + 1) + (max_num_blocks + 1)},
+      topk_ids.options());
+
+  int32_t* __restrict__ sorted_ids = buffer.data_ptr<int32_t>();
+  int32_t* __restrict__ expert_ids = sorted_ids + max_num_tokens_padded;
+  int32_t* __restrict__ total_cnts = expert_ids + max_num_blocks;
+  int32_t* __restrict__ cumsums    = total_cnts + (num_threads + 1) * E;
+  int32_t* __restrict__ offsets    = cumsums    + (E + 1);
+
+  int64_t numel = M * topk;
+  at::parallel_for(0, max_num_blocks, GRAIN_SIZE / BLOCK_M, [&](int64_t begin, int64_t end) {
+    int64_t m_start = begin * BLOCK_M;
+    int64_t m_size = std::min((end - begin) * BLOCK_M, max_num_tokens_padded - m_start);
+    fill_stub(sorted_ids + m_start, (int32_t)numel, m_size);
+    fill_stub(expert_ids + begin, (int32_t)E, end - begin);
+  });
+  at::parallel_for(0, (num_threads + 1) * E + (E + 1), GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+    fill_stub(total_cnts + begin, 0, end - begin);
+  });
+
+  int64_t num_tokens_post_pad = moe_align_block_size<BLOCK_M>(
+      sorted_ids, expert_ids, topk_ids.data_ptr<int32_t>(), total_cnts, cumsums, offsets, E, numel, num_threads);
+
+  // buffer: ic0 [M*topk, 2N], ic1 [M*topk, N], ic2 [M*topk, K],
+  //         A_tmp [T, BLOCK_M*K], C_tmp [T, 2*BLOCK_M*BLOCK_N], B_tmp [T, MAX_CACHE_BLOCK_SIZE*BLOCK_N*max(K,N)]
+  int64_t buffer_size_nbytes = M * topk * N * 2 + M * topk * K * 2 +
+      num_threads * BLOCK_M * K * 2 +
+      num_threads * 2 * BLOCK_M * BLOCK_N * sizeof(float) +
+      M * topk * 2 * N * 2 + num_threads * MAX_CACHE_BLOCK_SIZE * BLOCK_N * std::max(K, N) * 2;
+
+  auto buffer2 = at::empty({buffer_size_nbytes}, hidden_states.options().dtype(at::kChar));
+
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "fused_experts_mxfp4_kernel_impl", [&] {
+    scalar_t* __restrict__ intermediate_cache1 = (scalar_t*)((void*)(buffer2.data_ptr<int8_t>()));
+    scalar_t* __restrict__ intermediate_cache2 = intermediate_cache1 + M * topk * N;
+    scalar_t* __restrict__ A_tmp = (scalar_t*)((void*)(intermediate_cache2 + M * topk * K));
+    float* __restrict__ C_tmp = (float*)((void*)(A_tmp + num_threads * BLOCK_M * K));
+    scalar_t* __restrict__ intermediate_cache0 = (scalar_t*)((void*)(C_tmp + num_threads * 2 * BLOCK_M * BLOCK_N));
+    scalar_t* __restrict__ B_tmp = (scalar_t*)((void*)(intermediate_cache0 + M * topk * 2 * N));
+
+    bool with_bias = w1_bias.has_value();
+    auto act_func = alpha.has_value() && limit.has_value() ? CPUAcTMethod::swiglu : CPUAcTMethod::silu_and_mul;
+
+    fused_experts_fp_kernel_impl<scalar_t, uint8_t, uint8_t, true>(
+        out_hidden_states.data_ptr<scalar_t>(),
+        intermediate_cache0,
+        intermediate_cache1,
+        intermediate_cache2,
+        A_tmp,
+        B_tmp,
+        C_tmp,
+        hidden_states.data_ptr<scalar_t>(),
+        packed_w1.data_ptr<uint8_t>(),
+        packed_w2.data_ptr<uint8_t>(),
+        with_bias ? w1_bias.value().data_ptr<float>() : nullptr,
+        with_bias ? w2_bias.value().data_ptr<float>() : nullptr,
+        w1_scale.data_ptr<uint8_t>(),
+        w2_scale.data_ptr<uint8_t>(),
+        /*block_size_N*/ 1,
+        /*block_size_K*/ 32,
+        topk_weights.data_ptr<float>(),
+        sorted_ids,
+        expert_ids,
+        offsets,
+        M,
+        N,
+        K,
+        E,
+        topk,
+        num_tokens_post_pad,
+        alpha.has_value() ? float(alpha.value()) : 0,
+        limit.has_value() ? float(limit.value()) : 0,
+        act_func,
+        with_bias);
   });
   return out_hidden_states;
 }
