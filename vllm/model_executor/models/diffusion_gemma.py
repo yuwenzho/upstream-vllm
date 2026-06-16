@@ -120,7 +120,7 @@ class DiffusionGemmaProcessingInfo(Gemma4ProcessingInfo):
         return super().get_mm_max_tokens_per_item(seq_len, mm_counts)
 
 
-@torch.compile(dynamic=True)
+#@torch.compile(dynamic=True)
 def _softcap_logits(logits: torch.Tensor, cap: float) -> torch.Tensor:
     # fp32 before tanh for numerical stability (matches HF DiffusionGemma).
     # Compiling fuses the cast/div/tanh/mul into one elementwise kernel over
@@ -270,10 +270,8 @@ class DiffusionGemmaForConditionalGeneration(
         inputs_embeds: torch.Tensor,
         probs: torch.Tensor,
     ) -> torch.Tensor:
-        embed_weight = self.model.embed_tokens.weight
-        soft_embeds = torch.matmul(
-            probs.to(embed_weight.dtype), embed_weight
-        ) * self.model.normalizer.to(inputs_embeds.dtype)
+        soft_embeds = self.model.embed_tokens.soft_forward(probs) \
+            * self.model.normalizer.to(inputs_embeds.dtype)
         return self.self_conditioning(inputs_embeds, soft_embeds)
 
     # ------------------------------------------------------------------ #
@@ -451,7 +449,7 @@ class DiffusionGemmaForConditionalGeneration(
         raise ValueError(f"Unsupported modality: {modality}")
 
 
-@torch.compile(dynamic=True)
+#@torch.compile(dynamic=True)
 def _compute_num_rejected(
     num_logits: torch.Tensor,
     num_sampled: torch.Tensor,
@@ -463,7 +461,7 @@ def _compute_num_rejected(
     return torch.where(is_denoise, query_lens, num_rejected)
 
 
-@torch.compile(dynamic=True)
+#@torch.compile(dynamic=True)
 def _compiled_sample_step(
     # Logits from the model [num_decode * CL, vocab]
     logits: torch.Tensor,
@@ -479,7 +477,7 @@ def _compiled_sample_step(
     is_encoder_phase: torch.Tensor,  # [max_num_reqs]
     confident_tensor: torch.Tensor,  # [max_num_reqs]
     sc_embeds: torch.Tensor,  # [max_num_reqs, CL, hidden]
-    embed_weight: torch.Tensor,  # [vocab, hidden]
+    embed_tokens: "VocabParallelEmbedding",  # TP-aware soft embedding
     normalizer: torch.Tensor,
     history: torch.Tensor,  # [max_num_reqs, ST, CL]
     history_len_tensor: torch.Tensor,  # [max_num_reqs]
@@ -627,8 +625,8 @@ def _compiled_sample_step(
     # sc_embeds directly. Storing the [.., hidden] soft embed instead of the full
     # [.., vocab] probs avoids a giant persistent buffer.
     sc_keep = (is_denoise & ~is_encoder_phase[decode_slots])[:, None, None]
-    soft_embeds = torch.matmul(probs.to(embed_weight.dtype), embed_weight) * normalizer
-    sc_embeds[decode_slots] = soft_embeds * sc_keep
+    soft_embeds = embed_tokens.soft_forward(probs) * normalizer
+    sc_embeds[decode_slots] = (soft_embeds * sc_keep).to(sc_embeds.dtype)
 
     # Overwrite canvas with argmax for newly converged denoise requests
     newly_converged = (converged & is_denoise).unsqueeze(1)
@@ -850,7 +848,7 @@ class DiffusionGemmaModelState(ModelState):
             t_max=gen["t_max"],
             entropy_bound=entropy_bound,
             confidence_threshold=gen["confidence_threshold"],
-            embed_weight=self.model.model.embed_tokens.weight,
+            embed_tokens=self.model.model.embed_tokens,
             normalizer=self.model.model.normalizer,
         ), None
 
@@ -1052,14 +1050,15 @@ class DiffusionSampler:
         t_min: float,
         t_max: float,
         entropy_bound: float,
-        embed_weight: torch.Tensor,
+        embed_tokens: "VocabParallelEmbedding",
         normalizer: torch.Tensor,
     ):
         self.sampling_states = sampler.sampling_states
         self.req_states = sampler.req_states
-        # Self-conditioning soft embed = probs @ embed_weight * normalizer,
-        # computed in the sampler (see _compiled_sample_step).
-        self.embed_weight = embed_weight
+        # Self-conditioning soft embed = embed_tokens.soft_forward(probs) * normalizer,
+        # computed in the sampler (see _compiled_sample_step). soft_forward is
+        # TP-aware (shards vocab, all-reduces hidden). See Gap-1 fix.
+        self.embed_tokens = embed_tokens
         self.normalizer = normalizer
         self.canvas_length = (
             diffusion_config.canvas_length if diffusion_config is not None else 32
@@ -1282,7 +1281,7 @@ class DiffusionSampler:
             states.is_encoder_phase,
             states.confident,
             states.self_conditioning_embeds,
-            self.embed_weight,
+            self.embed_tokens,
             self.normalizer,
             states.accepted_canvas_history,
             states.accepted_canvas_history_len,

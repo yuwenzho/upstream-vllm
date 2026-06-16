@@ -496,6 +496,31 @@ class VocabParallelEmbedding(PluggableLayer):
         output = tensor_model_parallel_all_reduce(output_parallel)
         return output
 
+    def soft_forward(self, probs: torch.Tensor) -> torch.Tensor:
+        """TP-aware soft embedding: compute ``probs @ weight``.
+
+        Unlike :meth:`forward` which looks up embeddings for discrete token
+        IDs, this takes a float probability distribution over the *full*
+        vocabulary and returns the probability-weighted sum of embeddings.
+
+        The decomposition mirrors :class:`RowParallelLinear` with
+        ``input_is_parallel=False``: each TP rank multiplies its local slice
+        of ``probs`` by its local weight shard, then an all-reduce sums the
+        partial results.  For TP=1 the all-reduce is a no-op.
+
+        Args:
+            probs: ``[..., full_vocab_size]`` float tensor.
+
+        Returns:
+            ``[..., embedding_dim]`` tensor of the same dtype as ``probs``.
+        """
+        si = self.shard_indices
+        num_org = si.org_vocab_end_index - si.org_vocab_start_index
+        weight = self.weight[:num_org]  # drop padding rows
+        probs_shard = probs[..., si.org_vocab_start_index:si.org_vocab_end_index]
+        local = torch.matmul(probs_shard.to(weight.dtype), weight)
+        return tensor_model_parallel_all_reduce(local)
+
     def extra_repr(self) -> str:
         s = f"num_embeddings={self.num_embeddings_per_partition}"
         s += f", embedding_dim={self.embedding_dim}"
