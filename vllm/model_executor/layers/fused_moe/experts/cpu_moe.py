@@ -3,36 +3,12 @@
 """CPU fused MoE experts."""
 
 import math
+import os
 import sys
 from collections.abc import Callable
 from typing import cast
 
-import os
-
 import torch
-
-# Set VLLM_CPU_MOE_FP8_W8A8=1 to enable the FP8 W8A8 MoE path on CPU.
-# Mirrors SGLang's SGLANG_DEEPSEEK_FP8A8 env-var selection approach.
-_CPU_MOE_FP8_W8A8: bool = os.getenv("VLLM_CPU_MOE_FP8_W8A8", "0") == "1"
-
-
-def _use_fp8_w8a8_moe() -> bool:
-    """Return True when CPU FP8 W8A8 MoE is both enabled and supported.
-
-    Requires the env var ``VLLM_CPU_MOE_FP8_W8A8=1`` **and** the
-    compiled sgl-kernel ops (``float8_linear_prepack_cpu`` /
-    ``quantize_fp8e4m3_vec``) to be available.
-    """
-    if not _CPU_MOE_FP8_W8A8:
-        return False
-    try:
-        return (
-            hasattr(torch.ops._C, "float8_linear_prepack_cpu")
-            and hasattr(torch.ops._C, "quantize_fp8e4m3_vec")
-        )
-    except Exception:
-        return False
-
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm._custom_ops import (
@@ -68,6 +44,28 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.utils.math_utils import round_up
+
+# Set VLLM_CPU_MOE_FP8_W8A8=1 to enable the FP8 W8A8 MoE path on CPU.
+# Mirrors SGLang's SGLANG_DEEPSEEK_FP8A8 env-var selection approach.
+_CPU_MOE_FP8_W8A8: bool = os.getenv("VLLM_CPU_MOE_FP8_W8A8", "0") == "1"
+
+
+def _use_fp8_w8a8_moe() -> bool:
+    """Return True when CPU FP8 W8A8 MoE is both enabled and supported.
+
+    Requires the env var ``VLLM_CPU_MOE_FP8_W8A8=1`` **and** the
+    compiled sgl-kernel ops (``float8_linear_prepack_cpu`` /
+    ``quantize_fp8e4m3_vec``) to be available.
+    """
+    if not _CPU_MOE_FP8_W8A8:
+        return False
+    try:
+        return hasattr(torch.ops._C, "float8_linear_prepack_cpu") and hasattr(
+            torch.ops._C, "quantize_fp8e4m3_vec"
+        )
+    except Exception:
+        return False
+
 
 # ===========================================================================
 # Routing
@@ -182,6 +180,51 @@ def select_experts(
         topk_weights = topk_weights.to(torch.float32).contiguous()
         topk_ids = topk_ids.to(torch.int32).contiguous()
         return topk_weights, topk_ids
+
+
+# RoutingMethodType -> (scoring_func, renormalize) for CPU quantized monolithic
+# experts. Only covers routing methods CPU already whitelists. SigmoidRenorm/
+# Sigmoid are intentionally omitted: CPU quantized experts never forward
+# custom_routing_function, so allowing them would silently compute the wrong
+# routing for models that need it.
+_CPU_ROUTING_PARAMS: dict[RoutingMethodType, tuple[str, bool]] = {
+    RoutingMethodType.Default: ("softmax", False),
+    RoutingMethodType.Renormalize: ("softmax", True),
+    RoutingMethodType.RenormalizeNaive: ("softmax", True),
+    RoutingMethodType.DeepSeekV3: ("sigmoid", True),
+}
+
+
+def cpu_supports_routing_method(routing_method: RoutingMethodType) -> bool:
+    return routing_method in _CPU_ROUTING_PARAMS
+
+
+def cpu_select_experts(
+    moe_config: FusedMoEConfig,
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    *,
+    num_expert_group: int | None,
+    topk_group: int | None,
+    e_score_correction_bias: torch.Tensor | None,
+    routed_scaling_factor: float | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Shared routing entry point for CPU quantized monolithic experts."""
+    scoring_func, renormalize = _CPU_ROUTING_PARAMS[moe_config.routing_method]
+    return select_experts(
+        hidden_states=hidden_states,
+        router_logits=router_logits,
+        use_grouped_topk=num_expert_group is not None,
+        top_k=moe_config.experts_per_token,
+        renormalize=renormalize,
+        topk_group=topk_group,
+        num_expert_group=num_expert_group,
+        scoring_func=scoring_func,
+        routed_scaling_factor=(
+            routed_scaling_factor if routed_scaling_factor is not None else 1.0
+        ),
+        e_score_correction_bias=e_score_correction_bias,
+    )
 
 
 # ===========================================================================
@@ -632,11 +675,7 @@ class CPUExpertsFp8(mk.FusedMoEExpertsMonolithic):
         weight_key: QuantKey | None,
         activation_key: QuantKey | None,
     ) -> bool:
-        return routing_method in [
-            RoutingMethodType.Default,
-            RoutingMethodType.Renormalize,
-            RoutingMethodType.RenormalizeNaive,
-        ]
+        return cpu_supports_routing_method(routing_method)
 
     @staticmethod
     def _supports_router_logits_dtype(
@@ -662,23 +701,14 @@ class CPUExpertsFp8(mk.FusedMoEExpertsMonolithic):
         routed_scaling_factor: float | None = None,
         topk_group: int | None = None,
     ) -> torch.Tensor:
-        topk_weights, topk_ids = select_experts(
+        topk_weights, topk_ids = cpu_select_experts(
+            moe_config=self.moe_config,
             hidden_states=hidden_states,
             router_logits=router_logits,
-            use_grouped_topk=num_expert_group is not None,
-            top_k=self.moe_config.experts_per_token,
-            renormalize=self.moe_config.routing_method
-            in (
-                RoutingMethodType.Renormalize,
-                RoutingMethodType.RenormalizeNaive,
-            ),
-            topk_group=topk_group,
             num_expert_group=num_expert_group,
-            scoring_func="softmax",
-            routed_scaling_factor=(
-                routed_scaling_factor if routed_scaling_factor is not None else 1.0
-            ),
+            topk_group=topk_group,
             e_score_correction_bias=e_score_correction_bias,
+            routed_scaling_factor=routed_scaling_factor,
         )
 
         block_shape = (
@@ -820,23 +850,14 @@ class CPUExpertsMxfp4(mk.FusedMoEExpertsMonolithic):
         routed_scaling_factor: float | None = None,
         topk_group: int | None = None,
     ) -> torch.Tensor:
-        topk_weights, topk_ids = select_experts(
+        topk_weights, topk_ids = cpu_select_experts(
+            moe_config=self.moe_config,
             hidden_states=hidden_states,
             router_logits=router_logits,
-            use_grouped_topk=num_expert_group is not None,
-            top_k=self.moe_config.experts_per_token,
-            renormalize=self.moe_config.routing_method
-            in (
-                RoutingMethodType.Renormalize,
-                RoutingMethodType.RenormalizeNaive,
-            ),
-            topk_group=topk_group,
             num_expert_group=num_expert_group,
-            scoring_func="softmax",
-            routed_scaling_factor=(
-                routed_scaling_factor if routed_scaling_factor is not None else 1.0
-            ),
+            topk_group=topk_group,
             e_score_correction_bias=e_score_correction_bias,
+            routed_scaling_factor=routed_scaling_factor,
         )
 
         # Get bias and swiglu params from quant config
@@ -1036,23 +1057,14 @@ class CPUExpertsInt4(mk.FusedMoEExpertsMonolithic):
                 "apply_router_weight_on_input=True. "
             )
 
-        topk_weights, topk_ids = select_experts(
+        topk_weights, topk_ids = cpu_select_experts(
+            moe_config=self.moe_config,
             hidden_states=hidden_states,
             router_logits=router_logits,
-            use_grouped_topk=num_expert_group is not None,
-            top_k=self.moe_config.experts_per_token,
-            renormalize=self.moe_config.routing_method
-            in (
-                RoutingMethodType.Renormalize,
-                RoutingMethodType.RenormalizeNaive,
-            ),
-            topk_group=topk_group,
             num_expert_group=num_expert_group,
-            scoring_func="softmax",
-            routed_scaling_factor=(
-                routed_scaling_factor if routed_scaling_factor is not None else 1.0
-            ),
+            topk_group=topk_group,
             e_score_correction_bias=e_score_correction_bias,
+            routed_scaling_factor=routed_scaling_factor,
         )
 
         return fused_experts_cpu(
@@ -1210,23 +1222,14 @@ class CPUExpertsInt8(mk.FusedMoEExpertsMonolithic):
         routed_scaling_factor: float | None = None,
         topk_group: int | None = None,
     ) -> torch.Tensor:
-        topk_weights, topk_ids = select_experts(
+        topk_weights, topk_ids = cpu_select_experts(
+            moe_config=self.moe_config,
             hidden_states=hidden_states,
             router_logits=router_logits,
-            use_grouped_topk=num_expert_group is not None,
-            top_k=self.moe_config.experts_per_token,
-            renormalize=self.moe_config.routing_method
-            in (
-                RoutingMethodType.Renormalize,
-                RoutingMethodType.RenormalizeNaive,
-            ),
-            topk_group=topk_group,
             num_expert_group=num_expert_group,
-            scoring_func="softmax",
-            routed_scaling_factor=(
-                routed_scaling_factor if routed_scaling_factor is not None else 1.0
-            ),
+            topk_group=topk_group,
             e_score_correction_bias=e_score_correction_bias,
+            routed_scaling_factor=routed_scaling_factor,
         )
 
         return fused_experts_cpu(
@@ -1368,23 +1371,14 @@ class ArmCPUExpertsInt8(mk.FusedMoEExpertsMonolithic):
         routed_scaling_factor: float | None = None,
         topk_group: int | None = None,
     ) -> torch.Tensor:
-        topk_weights, topk_ids = select_experts(
+        topk_weights, topk_ids = cpu_select_experts(
+            moe_config=self.moe_config,
             hidden_states=hidden_states,
             router_logits=router_logits,
-            use_grouped_topk=num_expert_group is not None,
-            top_k=self.moe_config.experts_per_token,
-            renormalize=self.moe_config.routing_method
-            in (
-                RoutingMethodType.Renormalize,
-                RoutingMethodType.RenormalizeNaive,
-            ),
-            topk_group=topk_group,
             num_expert_group=num_expert_group,
-            scoring_func="softmax",
-            routed_scaling_factor=(
-                routed_scaling_factor if routed_scaling_factor is not None else 1.0
-            ),
+            topk_group=topk_group,
             e_score_correction_bias=e_score_correction_bias,
+            routed_scaling_factor=routed_scaling_factor,
         )
 
         if apply_router_weight_on_input:
@@ -1408,6 +1402,7 @@ class ArmCPUExpertsInt8(mk.FusedMoEExpertsMonolithic):
             skip_weighted=apply_router_weight_on_input,
         )
 
+
 # ===========================================================================
 # FP8 W8A8 MoE
 # ===========================================================================
@@ -1426,7 +1421,7 @@ def prepare_fp8_w8a8_moe_layer_for_cpu(
     packed_w13_scale_list = []
 
     for i in range(E):
-        w1_exp = w13[i]        # [2N, K] FP8
+        w1_exp = w13[i]  # [2N, K] FP8
         ws_exp = w13_scale[i]  # [2N, K/128] or [2N_blocks, K/128]
 
         # Align scale rows to weight rows if necessary (for block-128 checkpoints
@@ -1475,9 +1470,8 @@ class CPUExpertsFp8W8A8(mk.FusedMoEExpertsMonolithic):
         if not current_platform.is_cpu():
             return False
         try:
-            return (
-                hasattr(torch.ops._C, "float8_linear_prepack_cpu")
-                and hasattr(torch.ops._C, "quantize_fp8e4m3_vec")
+            return hasattr(torch.ops._C, "float8_linear_prepack_cpu") and hasattr(
+                torch.ops._C, "quantize_fp8e4m3_vec"
             )
         except Exception:
             return False
@@ -1513,11 +1507,7 @@ class CPUExpertsFp8W8A8(mk.FusedMoEExpertsMonolithic):
         weight_key: QuantKey | None,
         activation_key: QuantKey | None,
     ) -> bool:
-        return routing_method in [
-            RoutingMethodType.Default,
-            RoutingMethodType.Renormalize,
-            RoutingMethodType.RenormalizeNaive,
-        ]
+        return cpu_supports_routing_method(routing_method)
 
     @staticmethod
     def _supports_router_logits_dtype(
@@ -1525,24 +1515,6 @@ class CPUExpertsFp8W8A8(mk.FusedMoEExpertsMonolithic):
         routing_method: RoutingMethodType,
     ) -> bool:
         return True
-
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """Prepack FP8 W8A8 MoE weights: w13 via float8_linear_prepack_cpu,
-        w2 via convert_weight_packed."""
-        from vllm.model_executor.utils import replace_parameter
-
-        packed_w13, packed_w13_scale, packed_w2, w2_scale = (
-            prepare_fp8_w8a8_moe_layer_for_cpu(
-                layer.w13_weight,
-                layer.w2_weight,
-                layer.w13_weight_scale_inv,
-                layer.w2_weight_scale_inv,
-            )
-        )
-        replace_parameter(layer, "w13_weight", packed_w13)
-        replace_parameter(layer, "w13_weight_scale_inv", packed_w13_scale)
-        replace_parameter(layer, "w2_weight", packed_w2)
-        replace_parameter(layer, "w2_weight_scale_inv", w2_scale)
 
     def apply(
         self,
@@ -1560,25 +1532,14 @@ class CPUExpertsFp8W8A8(mk.FusedMoEExpertsMonolithic):
         routed_scaling_factor: float | None = None,
         topk_group: int | None = None,
     ) -> torch.Tensor:
-        topk_weights, topk_ids = select_experts(
+        topk_weights, topk_ids = cpu_select_experts(
+            moe_config=self.moe_config,
             hidden_states=hidden_states,
             router_logits=router_logits,
-            use_grouped_topk=num_expert_group is not None,
-            top_k=self.moe_config.experts_per_token,
-            renormalize=self.moe_config.routing_method
-            in (
-                RoutingMethodType.Renormalize,
-                RoutingMethodType.RenormalizeNaive,
-            ),
-            topk_group=topk_group,
             num_expert_group=num_expert_group,
-            scoring_func="softmax",
-            routed_scaling_factor=(
-                routed_scaling_factor
-                if routed_scaling_factor is not None
-                else 1.0
-            ),
+            topk_group=topk_group,
             e_score_correction_bias=e_score_correction_bias,
+            routed_scaling_factor=routed_scaling_factor,
         )
 
         block_shape = (

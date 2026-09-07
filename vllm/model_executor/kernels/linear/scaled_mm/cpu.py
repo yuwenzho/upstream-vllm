@@ -262,12 +262,17 @@ class CPUFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         # Skip the base class process (FP8 padding / fnuz normalization)
         # which is GPU-oriented.  Instead, VNNI-prepack weights for AMX.
         params = self._get_layer_params(layer)
-        packed_weight = torch.ops._C.convert_weight_packed(params.weight)
-        replace_parameter(
-            layer,
-            params.WEIGHT,
-            torch.nn.Parameter(packed_weight, requires_grad=False),
-        )
+
+        # MLA's kv_b_proj (see `_cpu_skip_gemm_dispatch`): MLA reads this
+        # weight to derive W_UK/W_UV, so keep the checkpoint [N, K] layout and
+        # let the kernel pack on the fly instead.
+        if not getattr(layer, "_cpu_skip_gemm_dispatch", False):
+            packed_weight = torch.ops._C.convert_weight_packed(params.weight)
+            replace_parameter(
+                layer,
+                params.WEIGHT,
+                torch.nn.Parameter(packed_weight, requires_grad=False),
+            )
 
         # Re-wrap scale as a plain Parameter so the kernel can read it
         # without weight-loader metadata interfering.
@@ -310,7 +315,7 @@ class CPUFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
             list(self.weight_group_shape),
             bias,
             x.dtype,
-            True,  # is_vnni (weight already prepacked)
+            not getattr(layer, "_cpu_skip_gemm_dispatch", False),  # is_vnni
         )
         return out.reshape(x.shape[:-1] + (out.size(-1),)) if x.dim() > 2 else out
 
@@ -380,6 +385,13 @@ class CPUFp8BlockScaledMMW8A8Kernel(Fp8BlockScaledMMLinearKernel):
         """
         params = self._get_layer_params(layer)
         weight = params.weight  # [N, K]
+
+        # MLA's kv_b_proj (see `_cpu_skip_gemm_dispatch`): MLA reads this
+        # weight to derive W_UK/W_UV, so keep the checkpoint [N, K] layout and
+        # its block scales; apply_weights falls back to the W8A16 op.
+        if getattr(layer, "_cpu_skip_gemm_dispatch", False):
+            return
+
         weight_scale = (
             params.weight_scale_inv
             if params.weight_scale_inv is not None
@@ -392,9 +404,9 @@ class CPUFp8BlockScaledMMW8A8Kernel(Fp8BlockScaledMMLinearKernel):
 
         # Expand scale rows: [ceil(N/block_n), G] → [N, G]
         if weight_scale.size(0) != N:
-            weight_scale_expanded = weight_scale.repeat_interleave(
-                block_n, dim=0
-            )[:N, :].contiguous()
+            weight_scale_expanded = weight_scale.repeat_interleave(block_n, dim=0)[
+                :N, :
+            ].contiguous()
         else:
             weight_scale_expanded = weight_scale.contiguous()
 
@@ -433,6 +445,21 @@ class CPUFp8BlockScaledMMW8A8Kernel(Fp8BlockScaledMMLinearKernel):
         )
 
         x_2d = x.reshape(-1, x.shape[-1]) if x.dim() > 2 else x
+        if getattr(layer, "_cpu_skip_gemm_dispatch", False):
+            # Unpacked weight: fp8_scaled_mm_with_quant has no is_vnni option,
+            # so fall back to the W8A16 op (BF16 activation, block-scaled FP8
+            # weight) for this layer.
+            out = torch.ops._C.fp8_scaled_mm_cpu(
+                x_2d,
+                params.weight,
+                weight_scale,
+                list(self.weight_group_shape),
+                bias,
+                x.dtype,
+                False,  # is_vnni
+            )
+            return out.reshape(x.shape[:-1] + (out.size(-1),)) if x.dim() > 2 else out
+
         # act_scales=None + channelwise=True → dynamic per-token activation quant
         out = ops.fp8_scaled_mm_with_quant(
             x_2d,
@@ -490,9 +517,8 @@ class CPUFp8W8A8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         weight = getattr(layer, w_name)
         weight_scale = getattr(layer, ws_name)
 
-        # vLLM stores linear weight as [K, N], while the CPU prepack op expects
-        # [N, K]. Keep K/N explicit to avoid shape inversions.
-        K, N = weight.shape[-2], weight.shape[-1]
+        # vLLM stores linear weight as [K, N], while the CPU prepack op expects [N, K].
+        N = weight.shape[-1]
 
         # Ensure scale is 2D [N, G]
         ws = weight_scale
