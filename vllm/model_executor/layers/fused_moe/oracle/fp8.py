@@ -128,8 +128,8 @@ def _get_priority_backends(
         _move_to_front(_AVAILABLE_BACKENDS, Fp8MoeBackend.XPU)
 
     if current_platform.is_cpu():
-        # CPU platform: single CPU backend; W8A8 vs W8A16 is decided by
-        # VLLM_CPU_MOE_FP8_W8A8 env var inside CPUExpertsFp8W8A8._supports_quant_scheme().
+        # CPU platform: W8A8 vs W8A16 is decided by VLLM_CPU_MOE_FP8_W8A8
+        # env var inside CPUExpertsFp8W8A8._supports_quant_scheme().
         _move_to_front(_AVAILABLE_BACKENDS, Fp8MoeBackend.CPU)
 
     return _AVAILABLE_BACKENDS

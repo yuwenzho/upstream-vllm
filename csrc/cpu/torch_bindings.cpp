@@ -95,18 +95,14 @@ at::Tensor fp8_scaled_mm_cpu(at::Tensor& mat1, at::Tensor& mat2,
 // Adapted from sglang: FP8 W8A8 kernels
 std::tuple<at::Tensor, at::Tensor> float8_linear_prepack_impl(
     const at::Tensor& weight, const at::Tensor& scales);
-at::Tensor fp8_scaled_mm_with_quant(
-    const at::Tensor& act,
-    const std::optional<at::Tensor>& act_scales,
-    bool channelwise,
-    const at::Tensor& weight,
-    const at::Tensor& weight_scales,
-    const std::optional<at::Tensor>& bias,
-    at::ScalarType output_dtype);
+at::Tensor fp8_scaled_mm_with_quant(const at::Tensor& act,
+                                    const std::optional<at::Tensor>& act_scales,
+                                    bool channelwise, const at::Tensor& weight,
+                                    const at::Tensor& weight_scales,
+                                    const std::optional<at::Tensor>& bias,
+                                    at::ScalarType output_dtype);
 std::tuple<at::Tensor, at::Tensor> quantize_fp8e4m3_vec(
-    const at::Tensor& t,
-    bool channelwise,
-    c10::optional<at::Tensor> scale_opt);
+    const at::Tensor& t, bool channelwise, c10::optional<at::Tensor> scale_opt);
 
 // Adapted from sglang: MLA CPU kernels (AMX-only)
 void decode_attention_cpu(at::Tensor& query, at::Tensor& k_buffer,
@@ -556,14 +552,19 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
   // Adapted from sglang: FP8 W8A8 kernels
   ops.def(
-      "float8_linear_prepack_cpu(Tensor weight, Tensor scales) -> (Tensor, Tensor)");
-  ops.impl("float8_linear_prepack_cpu", torch::kCPU, &float8_linear_prepack_impl);
+      "float8_linear_prepack_cpu(Tensor weight, Tensor scales) -> (Tensor, "
+      "Tensor)");
+  ops.impl("float8_linear_prepack_cpu", torch::kCPU,
+           &float8_linear_prepack_impl);
   ops.def(
-      "fp8_scaled_mm_with_quant(Tensor act, Tensor? act_scales, bool channelwise, "
-      "Tensor weight, Tensor weight_scales, Tensor? bias, ScalarType output_dtype) -> Tensor");
+      "fp8_scaled_mm_with_quant(Tensor act, Tensor? act_scales, bool "
+      "channelwise, "
+      "Tensor weight, Tensor weight_scales, Tensor? bias, ScalarType "
+      "output_dtype) -> Tensor");
   ops.impl("fp8_scaled_mm_with_quant", torch::kCPU, &fp8_scaled_mm_with_quant);
   ops.def(
-      "quantize_fp8e4m3_vec(Tensor input, bool channelwise, Tensor? scale_opt) -> (Tensor, Tensor)");
+      "quantize_fp8e4m3_vec(Tensor input, bool channelwise, Tensor? scale_opt) "
+      "-> (Tensor, Tensor)");
   ops.impl("quantize_fp8e4m3_vec", torch::kCPU, &quantize_fp8e4m3_vec);
 
   ops.def("causal_conv1d_weight_pack(Tensor weight) -> Tensor");

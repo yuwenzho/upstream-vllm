@@ -31,6 +31,7 @@ RTOL = 1e-1  # FP8 precision is low; we use a generous tolerance
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def quantize_weight_per_tensor(
     weight: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -47,15 +48,17 @@ def quantize_weight_per_channel(
     """Quantize weight [N, K] to FP8 with per-channel (per-output) scales."""
     abs_max = weight.abs().amax(dim=1)  # [N]
     scale = (abs_max / FP8_MAX).clamp(min=1e-7)
-    q = (weight.float() / scale.unsqueeze(1)).clamp(-FP8_MAX, FP8_MAX).to(
-        torch.float8_e4m3fn
+    q = (
+        (weight.float() / scale.unsqueeze(1))
+        .clamp(-FP8_MAX, FP8_MAX)
+        .to(torch.float8_e4m3fn)
     )
     return q, scale  # [N]
 
 
 def reference_linear_fp8(
-    x: torch.Tensor,          # BF16 [M, K]
-    weight_fp8: torch.Tensor, # FP8 [N, K]
+    x: torch.Tensor,  # BF16 [M, K]
+    weight_fp8: torch.Tensor,  # FP8 [N, K]
     weight_scale: torch.Tensor,  # float32, scalar or [N]
     act_scale: torch.Tensor | None,  # float32 scalar or [M] or None
     out_dtype: torch.dtype,
@@ -89,6 +92,7 @@ def reference_linear_fp8(
 # Tests: quantize_fp8e4m3_vec
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.parametrize("M,K", [(1, 256), (16, 512), (64, 1024)])
 def test_quantize_fp8e4m3_vec_channelwise(M: int, K: int):
     """Per-token (per-row) dynamic quantization of BF16 activations."""
@@ -109,6 +113,7 @@ def test_quantize_fp8e4m3_vec_channelwise(M: int, K: int):
 # Tests: float8_linear_prepack_cpu
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.parametrize("N,K", [(128, 256), (256, 512), (64, 128)])
 def test_prepack_round_trip(N: int, K: int):
     """Verify prepack doesn't lose data (packed weight has correct shape)."""
@@ -127,12 +132,16 @@ def test_prepack_round_trip(N: int, K: int):
 # Tests: fp8_scaled_mm_with_quant
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("M,N,K", [
-    (1, 128, 256),
-    (16, 256, 512),
-    (64, 128, 256),
-    (4, 64, 128),
-])
+
+@pytest.mark.parametrize(
+    "M,N,K",
+    [
+        (1, 128, 256),
+        (16, 256, 512),
+        (64, 128, 256),
+        (4, 64, 128),
+    ],
+)
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16])
 def test_fp8_w8a8_per_tensor_static(M: int, N: int, K: int, out_dtype: torch.dtype):
     """Static per-tensor W8A8: pre-quantized act with known scale."""
@@ -171,11 +180,14 @@ def test_fp8_w8a8_per_tensor_static(M: int, N: int, K: int, out_dtype: torch.dty
     )
 
 
-@pytest.mark.parametrize("M,N,K", [
-    (1, 128, 256),
-    (16, 256, 512),
-    (64, 128, 256),
-])
+@pytest.mark.parametrize(
+    "M,N,K",
+    [
+        (1, 128, 256),
+        (16, 256, 512),
+        (64, 128, 256),
+    ],
+)
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16])
 def test_fp8_w8a8_per_token_dynamic(M: int, N: int, K: int, out_dtype: torch.dtype):
     """Dynamic per-token W8A8: activation quantized on-the-fly."""
@@ -222,9 +234,12 @@ def test_fp8_w8a8_per_group(M: int, N: int, K: int):
     w_groups = weight.view(N, G, group_size)
     abs_max = w_groups.abs().amax(dim=2, keepdim=True)  # [N, G, 1]
     w_scale = (abs_max / FP8_MAX).clamp(min=1e-7).squeeze(2).float()  # [N, G]
-    w_fp8 = (w_groups.float() / abs_max).clamp(-FP8_MAX, FP8_MAX).to(
-        torch.float8_e4m3fn
-    ).view(N, K)
+    w_fp8 = (
+        (w_groups.float() / abs_max)
+        .clamp(-FP8_MAX, FP8_MAX)
+        .to(torch.float8_e4m3fn)
+        .view(N, K)
+    )
 
     # Prepack
     packed_w, packed_ws = torch.ops._C.float8_linear_prepack_cpu(w_fp8, w_scale)
